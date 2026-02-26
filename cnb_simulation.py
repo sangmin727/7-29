@@ -1,7 +1,11 @@
+import argparse
 import time
 
-import matplotlib.pyplot as plt
 import numpy as np
+
+
+GRID_K = 100
+GRID_COD = 150
 
 
 def J_cr(s_inf, l_cr, R_0, E):
@@ -25,8 +29,15 @@ def G_SIF_CNB(a, R_0, x):
 def G_SIF_INF(R_l, x):
     numerator = 2 * np.pi * (R_l + x)
     denominator = (np.pi * R_l) ** 1.5
-    acos_term = np.arccos(R_l / (R_l + x))
-    sqrt_term = R_l / np.sqrt(((R_l + x) ** 2) - (R_l**2))
+
+    ratio = R_l / (R_l + x)
+    ratio = np.clip(ratio, -1.0, 1.0)
+    acos_term = np.arccos(ratio)
+
+    radicand = ((R_l + x) ** 2) - (R_l**2)
+    radicand = np.maximum(radicand, np.finfo(float).eps)
+    sqrt_term = R_l / np.sqrt(radicand)
+
     return (numerator / denominator) * (acos_term + sqrt_term)
 
 
@@ -46,7 +57,7 @@ def K_dr(s_dr, l_cr, l_pz, R_0):
     if l_cr == l_pz:
         return 0
 
-    n = 100
+    n = GRID_K
     h = (l_pz - l_cr) / n
     x_h = np.arange(l_cr + h / 2, l_pz, h)
     Kx = G_SIF_CNB(l_pz, R_0, x_h) * h
@@ -55,7 +66,7 @@ def K_dr(s_dr, l_cr, l_pz, R_0):
 
 def K_inf(s_inf, l_pz, R_0):
     """SIF due to the remote stress s_inf."""
-    n = 100
+    n = GRID_K
     h = l_pz / n
     x_h = np.arange(h / 2, l_pz, h)
     Kx = G_SIF_CNB(l_pz, R_0, x_h) * h
@@ -84,8 +95,8 @@ def V_AZ_simp(s_inf, s_dr, l_cr, l_pz, R_0, E, _lambda):
 
 
 def COD_tot(s_inf, s_dr, x1, l_cr, l_pz, R_0, E):
-    """Compute COD_tot at the crack tip."""
-    n = 150
+    """Compute COD_tot at a position x1."""
+    n = GRID_COD
     dxi = (l_pz - x1) / n
     ds1 = x1 / n
     ds2 = (l_pz - x1) / n
@@ -195,10 +206,13 @@ def R_AZ(s_inf, s_dr, l_cr, l_pz, R_0, E, _lambda):
     return (1 / (2 * np.pi * (R_0 - l_pz))) * (V_plus - V_minus) / (2 * hh)
 
 
-def main():
-    start_time = time.time()
+def run_simulation(use_dt_current_for_growth=False, n_t=1000):
+    """
+    Run the CNB simulation.
 
-    n_t = 1000
+    If use_dt_current_for_growth=False, this matches the original provided script,
+    where growth updates use `dt`.
+    """
     dt_initial = 10
     dt_middle = 10
     dt = 10
@@ -220,7 +234,6 @@ def main():
     l_pz = [l]
     gamma = [gamma_0]
     t = [0]
-    J = []
     step = []
     SIF = []
 
@@ -239,14 +252,16 @@ def main():
         R_AZ_value = R_AZ(s_inf, s_dr, l_cr[i], l_pz[i], R_0, E, _lambda)
         term2 = gamma_tr * R_AZ_value
 
+        growth_dt = dt_current if use_dt_current_for_growth else dt
+
         if (term1 - term2) > 0:
-            l_pz_new = l_pz[i] + dt_current * k_pz * (term1 - term2)
+            l_pz_new = l_pz[i] + growth_dt * k_pz * (term1 - term2)
         else:
             l_pz_new = l_pz[i]
 
         J_cr_value = J_cr(s_inf, l_cr[i], R_0, E)
         if (J_cr_value - 2 * gamma[i]) > 0:
-            l_cr_new = l_cr[i] + dt_current * k_cr * (J_cr_value - 2 * gamma[i])
+            l_cr_new = l_cr[i] + growth_dt * k_cr * (J_cr_value - 2 * gamma[i])
         else:
             l_cr_new = l_cr[i]
 
@@ -269,7 +284,6 @@ def main():
         l_pz.append(l_pz_new)
         l_cr.append(l_cr_new)
         gamma.append(gamma_new)
-        J.append(J_cr_value)
 
         if (
             i >= 11
@@ -283,16 +297,12 @@ def main():
 
         K_cr_value = K_cr(s_inf, l_cr[i], R_0)
         if K_cr_value >= (k1c * (10**1.5)):
-            l_pz_new = R_0
-            l_cr_new = R_0
-            l_pz[-1] = l_pz_new
-            l_cr[-1] = l_cr_new
+            l_pz[-1] = R_0
+            l_cr[-1] = R_0
             break
         if l_pz_new >= R_0:
-            l_pz_new = R_0
-            l_pz[-1] = l_pz_new
+            l_pz[-1] = R_0
             break
-
         if l_cr_new >= R_0 or l_pz_new >= R_0:
             break
 
@@ -304,26 +314,45 @@ def main():
     if m > 1:
         lengthstep = l_pz[step] - l_cr[step]
         stepcrack = l_cr[step]
-
-        dumm = np.zeros(m)
-        dumm[1:] = np.diff(t[step])
-        dumm[0] = t[step][0]
-
-        timestep = dumm.copy()
+        timestep = np.zeros(m)
+        timestep[1:] = np.diff(t[step])
+        timestep[0] = t[step][0]
 
         dadt = lengthstep / timestep
         logdadt = np.log10(dadt)
 
         for idx in range(m):
-            SIF_value = K_cr(s_inf, stepcrack[idx], R_0)
-            SIF.append(SIF_value)
+            SIF.append(K_cr(s_inf, stepcrack[idx], R_0))
 
         SIF = np.array(SIF)
         logSIF = np.log10(SIF)
         fit = np.polyfit(logSIF, logdadt, 1)
         slopefit = fit[0] * logSIF + fit[1]
     else:
-        print("Not enough data points for plotting log(da/dt) vs. log(SIF).")
+        logdadt = np.array([])
+        logSIF = np.array([])
+        slopefit = np.array([])
+        fit = None
+
+    return {
+        "t": t,
+        "l_cr": l_cr,
+        "l_pz": l_pz,
+        "m": m,
+        "fit": fit,
+        "logdadt": logdadt,
+        "logSIF": logSIF,
+        "slopefit": slopefit,
+    }
+
+
+def plot_results(results):
+    import matplotlib.pyplot as plt
+
+    t = results["t"]
+    l_cr = results["l_cr"]
+    l_pz = results["l_pz"]
+    m = results["m"]
 
     plt.figure(figsize=(14, 6))
 
@@ -343,13 +372,14 @@ def main():
 
     if m > 1:
         plt.subplot(1, 2, 2)
-        plt.scatter(logSIF, logdadt)
-        plt.plot(logSIF, slopefit, "r-.")
+        plt.scatter(results["logSIF"], results["logdadt"])
+        plt.plot(results["logSIF"], results["slopefit"], "r-.")
         plt.xlabel("log(SIF), MPa·m$^{0.5}$", fontsize=15)
         plt.ylabel("log(da/dt), mm/s", fontsize=15)
+        fit = results["fit"]
         plt.text(
-            logSIF[0],
-            logdadt[-1] + 0.1,
+            results["logSIF"][0],
+            results["logdadt"][-1] + 0.1,
             f"$\\log(da/dt) = {fit[0]:.3f}\\; \\log(SIF) + {fit[1]:.3f}$",
             fontsize=14,
         )
@@ -368,6 +398,70 @@ def main():
 
     plt.tight_layout()
     plt.show()
+
+
+def compare_original_and_revised(n_t=1000):
+    original = run_simulation(use_dt_current_for_growth=False, n_t=n_t)
+    revised = run_simulation(use_dt_current_for_growth=True, n_t=n_t)
+
+    print("Comparison of original vs revised growth-time-step handling")
+    print(
+        f"- original: final t={original['t'][-1]:.2f}, "
+        f"l_cr={original['l_cr'][-1]:.6f}, l_pz={original['l_pz'][-1]:.6f}, "
+        f"steps={len(original['t'])}"
+    )
+    print(
+        f"- revised : final t={revised['t'][-1]:.2f}, "
+        f"l_cr={revised['l_cr'][-1]:.6f}, l_pz={revised['l_pz'][-1]:.6f}, "
+        f"steps={len(revised['t'])}"
+    )
+    print(
+        f"- deltas  : Δl_cr={revised['l_cr'][-1] - original['l_cr'][-1]:.6e}, "
+        f"Δl_pz={revised['l_pz'][-1] - original['l_pz'][-1]:.6e}, "
+        f"Δt={revised['t'][-1] - original['t'][-1]:.6e}"
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--mode",
+        choices=["original", "revised", "compare"],
+        default="compare",
+        help="Run the original version, revised version, or compare both.",
+    )
+    parser.add_argument(
+        "--plot",
+        action="store_true",
+        help="Plot results for the selected single mode (requires matplotlib).",
+    )
+    parser.add_argument("--n-t", type=int, default=1000, help="Number of time iterations.")
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Use reduced integration grids for faster approximate comparisons.",
+    )
+    args = parser.parse_args()
+
+    start_time = time.time()
+
+    global GRID_K, GRID_COD
+    if args.fast:
+        GRID_K = 40
+        GRID_COD = 60
+
+    if args.mode == "compare":
+        compare_original_and_revised(n_t=args.n_t)
+    else:
+        use_dt_current = args.mode == "revised"
+        results = run_simulation(use_dt_current_for_growth=use_dt_current, n_t=args.n_t)
+        print(
+            f"mode={args.mode}, final t={results['t'][-1]:.2f}, "
+            f"l_cr={results['l_cr'][-1]:.6f}, l_pz={results['l_pz'][-1]:.6f}, "
+            f"steps={len(results['t'])}"
+        )
+        if args.plot:
+            plot_results(results)
 
     end_time = time.time()
     print(f"Elapsed time: {end_time - start_time:.2f} seconds")
